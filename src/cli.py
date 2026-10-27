@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from .config import DATASET_OUTPUT_PARENT_PATH
-from .config import DATASET_SESSION_NAME
 from .config import ORIGINAL_IMAGE_INPUT_PATH
 from .config import PSEUDO_MASK_INPUT_PATH
 from pathlib import Path
@@ -27,7 +26,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--dataset-output", "--output-root",
         dest="dataset_output",
-        help="Parent directory where a YYYYMMDD_HHMM dataset folder is created.",
+        help="Parent directory where a folder named after the input session is created.",
     )
     parser.add_argument(
         "--fps",
@@ -44,6 +43,16 @@ def _optional_path(value: str | Path | None) -> Path | None:
     return Path(value).expanduser()
 
 
+def dataset_name_for_input(input_path: Path) -> str:
+    """Use an image session's parent name, e.g. 20260911_232403."""
+    input_path = Path(input_path).expanduser()
+    if input_path.name.lower() == "images" and input_path.parent.name:
+        return input_path.parent.name
+    if input_path.is_file():
+        return input_path.stem
+    return input_path.name or "dataset"
+
+
 def resolve_runtime_paths(argv: list[str] | None = None) -> tuple[Path, Path | None, Path | None, float | None]:
     args = parse_args(argv)
     input_path = _optional_path(args.input_path) or ORIGINAL_IMAGE_INPUT_PATH
@@ -57,5 +66,5 @@ def resolve_runtime_paths(argv: list[str] | None = None) -> tuple[Path, Path | N
         if args.dataset_output is not None
         else DATASET_OUTPUT_PARENT_PATH
     )
-    dataset_output = Path(dataset_parent).expanduser() / DATASET_SESSION_NAME
+    dataset_output = Path(dataset_parent).expanduser() / dataset_name_for_input(input_path)
     return Path(input_path).expanduser(), pseudo_mask, dataset_output, args.fps

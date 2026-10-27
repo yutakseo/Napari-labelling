@@ -168,12 +168,13 @@ def prepare_input_output(
 
 
 def write_dataset_metadata(dataset_root: Path) -> Path:
-    """Write class metadata beside the standard images/ and masks/ folders."""
+    """Write class metadata beside the images and GT-mask folders."""
     metadata = {
         "format": "semantic-segmentation-indexed-png",
         "images": "images",
-        "masks": "masks",
-        "pseudo_masks": "pseudo_masks (immutable pseudo-labels used as the Dice reference)",
+        "masks": "GT_mask",
+        "gt_masks": "GT_mask (manual ground-truth masks)",
+        "pseudo_masks": "masks (immutable original pseudo-labels used as the Dice reference)",
         "mask_previews": "mask_previews (visualization only; do not use for training)",
         "mask_dtype": "uint8",
         "background": {"id": 0, "name": "background"},
@@ -228,7 +229,7 @@ def prepare_segmentation_dataset(
     dataset_output_root: Path | None,
     video_fps: float | None = None,
 ) -> tuple[Path, Path, dict[str, Path], dict[str, Path], list[str]]:
-    """Stage data as dataset/images + dataset/masks with matching file stems."""
+    """Stage data as dataset/images + dataset/GT_mask with matching stems."""
     input_path = Path(input_path).expanduser()
 
     if is_video_path(input_path):
@@ -265,10 +266,10 @@ def prepare_segmentation_dataset(
         if pseudo_path.is_file() and pseudo_path.parent.name == "masks":
             load_dataset_class_definitions(pseudo_path.parent.parent)
     images_dir = dataset_root / "images"
-    masks_dir = dataset_root / "masks"
-    pseudo_masks_dir = dataset_root / "pseudo_masks"
+    gt_masks_dir = dataset_root / "GT_mask"
+    pseudo_masks_dir = dataset_root / "masks"
     images_dir.mkdir(parents=True, exist_ok=True)
-    masks_dir.mkdir(parents=True, exist_ok=True)
+    gt_masks_dir.mkdir(parents=True, exist_ok=True)
 
     rgb_map = {
         stem: _copy_source_image(source, images_dir)
@@ -278,18 +279,23 @@ def prepare_segmentation_dataset(
     mask_map: dict[str, Path] = {}
 
     for stem, image_path in rgb_map.items():
-        mask_path = masks_dir / f"{stem}.png"
+        mask_path = gt_masks_dir / f"{stem}.png"
         image = load_rgb(image_path)
         pseudo_path = pseudo_masks.get(stem)
 
-        # Keep a separate, immutable copy of the pseudo-label. `masks/` is
+        # Keep a separate, immutable copy of the pseudo-label. `GT_mask/` is
         # subsequently edited into GT, so it cannot serve as a Dice baseline.
         if pseudo_path is not None:
             pseudo_reference_path = pseudo_masks_dir / f"{stem}.png"
             if not pseudo_reference_path.exists():
                 pseudo_masks_dir.mkdir(parents=True, exist_ok=True)
-                pseudo_reference = load_multiclass_mask(pseudo_path, image.shape[:2])
-                iio.imwrite(pseudo_reference_path, pseudo_reference.astype(np.uint8))
+                # Preserve the supplied PNG exactly as the original pseudo
+                # label. The editable GT below is separately normalized to
+                # indexed class IDs as needed by the labeler.
+                if pseudo_path.suffix.lower() == ".png":
+                    shutil.copy2(pseudo_path, pseudo_reference_path)
+                else:
+                    iio.imwrite(pseudo_reference_path, iio.imread(pseudo_path))
 
         if not mask_path.exists():
             if pseudo_path is None:
@@ -304,7 +310,7 @@ def prepare_segmentation_dataset(
 
     keys = sorted(rgb_map)
     write_dataset_metadata(dataset_root)
-    return images_dir, masks_dir, rgb_map, mask_map, keys
+    return images_dir, gt_masks_dir, rgb_map, mask_map, keys
 
 
 def prepare_input_output_checked(

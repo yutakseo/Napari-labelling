@@ -23,8 +23,8 @@ from .dataset import write_dataset_metadata
 from .history import History
 from .input_events import InputFilter
 from .input_events import text_input_has_focus
+from .masks import binary_dice_components
 from .masks import compose_multiclass_mask
-from .masks import binary_dice_score
 from .masks import flood_fill_region
 from .masks import loadFrame
 from .masks import load_multiclass_mask
@@ -48,6 +48,10 @@ import numpy as np
 
 
 LOGGER = logging.getLogger(__name__)
+PSEUDO_LABEL_COLOR = (1.0, 0.35, 0.0, 1.0)  # orange; GT class colours stay configurable
+COMPARISON_COLORS = {
+    "pseudo_only": (255, 100, 0, 255), # orange: pseudo only
+}
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -59,12 +63,15 @@ def main(argv: list[str] | None = None) -> None:
         dataset_output_root=dataset_output_root,
         video_fps=video_fps,
     )
-    pseudo_mask_dir = mask_dir.parent / "pseudo_masks"
+    pseudo_mask_dir = mask_dir.parent / "masks"
     pseudo_mask_map = {
         frame_key: pseudo_mask_dir / f"{frame_key}.png"
         for frame_key in keys
         if (pseudo_mask_dir / f"{frame_key}.png").is_file()
     }
+    # Stores (intersection, denominator) for saved, inactive frames. The
+    # active frame is always calculated from its in-memory, unsaved GT mask.
+    dice_stats_cache: dict[str, tuple[int, int]] = {}
 
     state = {
         "idx": 0,
@@ -98,11 +105,16 @@ def main(argv: list[str] | None = None) -> None:
     autosave_timer = QtCore.QTimer(viewer.window._qt_window)
     autosave_timer.setSingleShot(True)
     autosave_timer.setInterval(AUTOSAVE_DELAY_MS)
+    metrics_timer = QtCore.QTimer(viewer.window._qt_window)
+    metrics_timer.setSingleShot(True)
+    metrics_timer.setInterval(120)
     change_timer = QtCore.QTimer(viewer.window._qt_window)
     change_timer.setInterval(CHANGE_SCAN_MS)
     mask_snapshot: np.ndarray | None = None
 
     img_layer = None
+    pseudo_layer = None
+    comparison_layer = None
     class_layers: dict[int, object] = {}
     histories = {class_id: History(MAX_HISTORY) for class_id in CLASS_DEFINITIONS}
 
@@ -256,23 +268,63 @@ def main(argv: list[str] | None = None) -> None:
             if parent is not None:
                 dice_label.move(max(8, parent.width() - dice_label.width() - 12), 12)
 
+        def dice_components_for(
+            frame: str,
+            gt_mask: np.ndarray | None = None,
+        ) -> tuple[int, int] | None:
+            pseudo_mask_path = pseudo_mask_map.get(frame)
+            if pseudo_mask_path is None:
+                return None
+            if gt_mask is None:
+                if frame in dice_stats_cache:
+                    return dice_stats_cache[frame]
+                raw_pseudo = np.asarray(iio.imread(pseudo_mask_path))
+                shape_hw = raw_pseudo.shape[:2]
+                gt_mask = load_multiclass_mask(mask_map[frame], shape_hw)
+            else:
+                shape_hw = gt_mask.shape[:2]
+            pseudo_mask = load_multiclass_mask(pseudo_mask_path, shape_hw)
+            stats = binary_dice_components(pseudo_mask, gt_mask)
+            if frame != keys[state["idx"]]:
+                dice_stats_cache[frame] = stats
+            return stats
+
         frame_key = keys[state["idx"]]
-        pseudo_mask_path = pseudo_mask_map.get(frame_key)
-        if pseudo_mask_path is None:
-            show_dice("Dice (pseudo vs GT): N/A", "이 프레임에는 보존된 수도 라벨이 없습니다.")
-            return
         try:
             gt_mask = compose_multiclass_mask(
                 {class_id: layer.data for class_id, layer in class_layers.items()}
             )
-            pseudo_mask = load_multiclass_mask(pseudo_mask_path, gt_mask.shape[:2])
-            dice = binary_dice_score(pseudo_mask, gt_mask)
+            frame_stats = dice_components_for(frame_key, gt_mask)
+            if frame_stats is None:
+                show_dice(
+                    "Frame Dice: N/A\nAll frames Dice: N/A",
+                    "이 프레임에는 보존된 수도 라벨이 없습니다.",
+                )
+                return
+            frame_intersection, frame_total = frame_stats
+            frame_dice = 1.0 if frame_total == 0 else (2.0 * frame_intersection) / frame_total
+
+            all_stats = [
+                frame_stats if key == frame_key else dice_components_for(key)
+                for key in keys
+            ]
+            if any(stats is None for stats in all_stats):
+                all_dice_text = "N/A"
+            else:
+                total_intersection = sum(stats[0] for stats in all_stats if stats is not None)
+                total_denominator = sum(stats[1] for stats in all_stats if stats is not None)
+                all_dice = 1.0 if total_denominator == 0 else (2.0 * total_intersection) / total_denominator
+                all_dice_text = f"{all_dice:.3f}"
         except Exception as exc:
-            show_dice("Dice (pseudo vs GT): error", f"Dice 계산 실패: {type(exc).__name__}: {exc}")
+            show_dice(
+                "Frame Dice: error\nAll frames Dice: error",
+                f"Dice 계산 실패: {type(exc).__name__}: {exc}",
+            )
             return
         show_dice(
-            f"Dice (pseudo vs GT): {dice:.3f}",
-            "수도 라벨과 현재 GT의 foreground Dice (모든 비배경 클래스 합산)",
+            f"Frame Dice: {frame_dice:.3f}\nAll frames Dice: {all_dice_text}",
+            "Frame: 현재 프레임의 Dice. All frames: 모든 프레임 픽셀을 합산한 global Dice. "
+            "모든 비배경 클래스를 foreground로 합산합니다.",
         )
 
     def apply_zoom(z: float):
@@ -299,10 +351,43 @@ def main(argv: list[str] | None = None) -> None:
             layer.visible = bool(state[f"class_{class_id}_visible"])
             try:
                 layers = viewer.layers
-                i = layers.index(layer)
-                layers.move(i, len(layers) - 1)
+                index = layers.index(layer)
+                layers.move(index, len(layers) - 1)
             except Exception:
                 pass
+
+    def comparison_rgba(pseudo_mask: np.ndarray, gt_mask: np.ndarray) -> np.ndarray:
+        """Show only pseudo pixels absent from the topmost GT layer."""
+        pseudo = np.asarray(pseudo_mask) > 0
+        gt = np.asarray(gt_mask) > 0
+        if pseudo.shape != gt.shape:
+            raise ValueError(f"Comparison shape mismatch: {pseudo.shape} vs {gt.shape}")
+        overlay = np.zeros((*gt.shape, 4), dtype=np.uint8)
+        overlay[np.logical_and(pseudo, ~gt)] = COMPARISON_COLORS["pseudo_only"]
+        return overlay
+
+    def refresh_comparison_overlay() -> None:
+        nonlocal comparison_layer
+        if set(class_layers) != set(CLASS_DEFINITIONS):
+            return
+        frame_key = keys[state["idx"]]
+        gt_mask = compose_multiclass_mask(
+            {class_id: layer.data for class_id, layer in class_layers.items()}
+        )
+        pseudo_mask_path = pseudo_mask_map.get(frame_key)
+        if pseudo_mask_path is None:
+            pseudo_mask = np.zeros(gt_mask.shape, dtype=np.uint8)
+        else:
+            pseudo_mask = load_multiclass_mask(pseudo_mask_path, gt_mask.shape[:2])
+        overlay = comparison_rgba(pseudo_mask, gt_mask)
+        if comparison_layer is None:
+            comparison_layer = viewer.add_image(
+                overlay,
+                name="Pseudo-only difference (orange; below GT)",
+                rgb=True,
+            )
+        else:
+            comparison_layer.data = overlay
 
     def _class_opacity_changed(class_id: int, _event=None):
         layer = class_layers.get(class_id)
@@ -737,6 +822,10 @@ def main(argv: list[str] | None = None) -> None:
     def scanMaskChange() -> None:
         if state["suspend"] or set(class_layers) != set(CLASS_DEFINITIONS):
             return
+        # Label-layer events already reported an edit; avoid repeatedly
+        # rebuilding a full-frame mask while the user is still painting.
+        if state["dirty"]:
+            return
         if mask_snapshot is None:
             syncMaskSnapshot()
             return
@@ -751,11 +840,16 @@ def main(argv: list[str] | None = None) -> None:
         if state["suspend"]:
             return
         state["dirty"] = True
-        syncMaskSnapshot()
         scheduleAutosave()
         set_window_title()
         refresh_page_ui()
+        # Defer full-resolution Dice and difference-overlay work until the
+        # brush stroke pauses, keeping the canvas responsive while drawing.
+        metrics_timer.start()
+
+    def refresh_metrics() -> None:
         refresh_dice_ui()
+        refresh_comparison_overlay()
 
     # ======================
     # IO / navigation
@@ -774,6 +868,9 @@ def main(argv: list[str] | None = None) -> None:
         except Exception as exc:
             raise RuntimeError(f"Mask save failed: {mask_path}") from exc
         write_dataset_metadata(mask_dir.parent)
+        if frame_key in pseudo_mask_map:
+            pseudo_mask = load_multiclass_mask(pseudo_mask_map[frame_key], mask_data.shape[:2])
+            dice_stats_cache[frame_key] = binary_dice_components(pseudo_mask, mask_data)
         dropFrame(frame_key)
         syncMaskSnapshot()
         state["dirty"] = False
@@ -813,7 +910,7 @@ def main(argv: list[str] | None = None) -> None:
             return False
 
     def openFrame() -> None:
-        nonlocal img_layer
+        nonlocal img_layer, pseudo_layer
 
         if autosave_timer.isActive():
             autosave_timer.stop()
@@ -833,6 +930,30 @@ def main(argv: list[str] | None = None) -> None:
             else:
                 img_layer.data = rgb
 
+            pseudo_mask_path = pseudo_mask_map.get(k)
+            if pseudo_mask_path is None:
+                pseudo_data = np.zeros(rgb.shape[:2], dtype=np.uint8)
+            else:
+                pseudo_data = (
+                    load_multiclass_mask(pseudo_mask_path, rgb.shape[:2]) > 0
+                ).astype(np.uint8)
+            if pseudo_layer is None:
+                pseudo_layer = viewer.add_labels(
+                    pseudo_data,
+                    name="Pseudo label (reference, orange)",
+                )
+                pseudo_layer.colormap = DirectLabelColormap(
+                    color_dict={None: (0, 0, 0, 0), 0: (0, 0, 0, 0), 1: PSEUDO_LABEL_COLOR}
+                )
+                pseudo_layer.opacity = 0.55
+                pseudo_layer.visible = False
+                try:
+                    pseudo_layer.editable = False
+                except Exception:
+                    pass
+            else:
+                pseudo_layer.data = pseudo_data
+
             for class_id, definition in CLASS_DEFINITIONS.items():
                 layer = class_layers.get(class_id)
                 if layer is None:
@@ -847,6 +968,7 @@ def main(argv: list[str] | None = None) -> None:
         finally:
             state["suspend"] = False
 
+        refresh_comparison_overlay()
         state["dirty"] = False
         syncMaskSnapshot()
         apply_colormaps()
@@ -1259,7 +1381,7 @@ def main(argv: list[str] | None = None) -> None:
             "border-radius: 4px; padding: 6px 9px; font-weight: bold; }"
         )
         dice_label.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        dice_label.setText("Dice (pseudo vs GT): N/A")
+        dice_label.setText("Frame Dice: N/A\nAll frames Dice: N/A")
         dice_label.adjustSize()
         dice_label.move(max(8, canvas_widget.width() - dice_label.width() - 12), 12)
         dice_label.show()
@@ -1288,6 +1410,7 @@ def main(argv: list[str] | None = None) -> None:
 
     # start
     autosave_timer.timeout.connect(flushAutosave)
+    metrics_timer.timeout.connect(refresh_metrics)
     change_timer.timeout.connect(scanMaskChange)
     change_timer.start()
 
@@ -1306,6 +1429,8 @@ def main(argv: list[str] | None = None) -> None:
     finally:
         if autosave_timer.isActive():
             autosave_timer.stop()
+        if metrics_timer.isActive():
+            metrics_timer.stop()
         try:
             if checkMaskChange():
                 state["dirty"] = True

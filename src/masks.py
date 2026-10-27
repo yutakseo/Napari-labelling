@@ -22,6 +22,17 @@ FILL_STRUCTURE = np.array(
 )
 
 
+def binary_dice_components(reference_mask: np.ndarray, gt_mask: np.ndarray) -> tuple[int, int]:
+    """Return the intersection and denominator used for foreground Dice."""
+    reference = np.asarray(reference_mask) > 0
+    gt = np.asarray(gt_mask) > 0
+    if reference.shape != gt.shape:
+        raise ValueError(
+            f"Dice shape mismatch: pseudo {reference.shape} vs GT {gt.shape}"
+        )
+    return int(np.logical_and(reference, gt).sum()), int(reference.sum()) + int(gt.sum())
+
+
 def binary_dice_score(reference_mask: np.ndarray, gt_mask: np.ndarray) -> float:
     """Return foreground Dice for a pseudo-label and its edited GT mask.
 
@@ -29,16 +40,9 @@ def binary_dice_score(reference_mask: np.ndarray, gt_mask: np.ndarray) -> float:
     meaningful when a session has more than one editable class. Two empty
     masks agree perfectly and therefore score 1.0.
     """
-    reference = np.asarray(reference_mask) > 0
-    gt = np.asarray(gt_mask) > 0
-    if reference.shape != gt.shape:
-        raise ValueError(
-            f"Dice shape mismatch: pseudo {reference.shape} vs GT {gt.shape}"
-        )
-    total = int(reference.sum()) + int(gt.sum())
+    intersection, total = binary_dice_components(reference_mask, gt_mask)
     if total == 0:
         return 1.0
-    intersection = int(np.logical_and(reference, gt).sum())
     return (2.0 * intersection) / total
 
 
