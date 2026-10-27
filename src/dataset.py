@@ -173,6 +173,7 @@ def write_dataset_metadata(dataset_root: Path) -> Path:
         "format": "semantic-segmentation-indexed-png",
         "images": "images",
         "masks": "masks",
+        "pseudo_masks": "pseudo_masks (immutable pseudo-labels used as the Dice reference)",
         "mask_previews": "mask_previews (visualization only; do not use for training)",
         "mask_dtype": "uint8",
         "background": {"id": 0, "name": "background"},
@@ -265,6 +266,7 @@ def prepare_segmentation_dataset(
             load_dataset_class_definitions(pseudo_path.parent.parent)
     images_dir = dataset_root / "images"
     masks_dir = dataset_root / "masks"
+    pseudo_masks_dir = dataset_root / "pseudo_masks"
     images_dir.mkdir(parents=True, exist_ok=True)
     masks_dir.mkdir(parents=True, exist_ok=True)
 
@@ -278,8 +280,18 @@ def prepare_segmentation_dataset(
     for stem, image_path in rgb_map.items():
         mask_path = masks_dir / f"{stem}.png"
         image = load_rgb(image_path)
+        pseudo_path = pseudo_masks.get(stem)
+
+        # Keep a separate, immutable copy of the pseudo-label. `masks/` is
+        # subsequently edited into GT, so it cannot serve as a Dice baseline.
+        if pseudo_path is not None:
+            pseudo_reference_path = pseudo_masks_dir / f"{stem}.png"
+            if not pseudo_reference_path.exists():
+                pseudo_masks_dir.mkdir(parents=True, exist_ok=True)
+                pseudo_reference = load_multiclass_mask(pseudo_path, image.shape[:2])
+                iio.imwrite(pseudo_reference_path, pseudo_reference.astype(np.uint8))
+
         if not mask_path.exists():
-            pseudo_path = pseudo_masks.get(stem)
             if pseudo_path is None:
                 initial_mask = np.zeros(image.shape[:2], dtype=np.uint8)
             else:

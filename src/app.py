@@ -24,6 +24,7 @@ from .history import History
 from .input_events import InputFilter
 from .input_events import text_input_has_focus
 from .masks import compose_multiclass_mask
+from .masks import binary_dice_score
 from .masks import flood_fill_region
 from .masks import loadFrame
 from .masks import load_multiclass_mask
@@ -58,6 +59,12 @@ def main(argv: list[str] | None = None) -> None:
         dataset_output_root=dataset_output_root,
         video_fps=video_fps,
     )
+    pseudo_mask_dir = mask_dir.parent / "pseudo_masks"
+    pseudo_mask_map = {
+        frame_key: pseudo_mask_dir / f"{frame_key}.png"
+        for frame_key in keys
+        if (pseudo_mask_dir / f"{frame_key}.png").is_file()
+    }
 
     state = {
         "idx": 0,
@@ -109,6 +116,7 @@ def main(argv: list[str] | None = None) -> None:
     visibility_buttons: dict[int, QtWidgets.QPushButton] = {}
     brush_controls: dict[int, tuple[QtWidgets.QSlider, QtWidgets.QSpinBox]] = {}
     class_summary_label: QtWidgets.QLabel | None = None
+    dice_label: QtWidgets.QLabel | None = None
 
     zoom_slider = None
     zoom_spin = None
@@ -235,6 +243,37 @@ def main(argv: list[str] | None = None) -> None:
         page_spin.setValue(v)
         page_slider.blockSignals(False)
         page_spin.blockSignals(False)
+
+    def refresh_dice_ui() -> None:
+        if dice_label is None:
+            return
+
+        def show_dice(text: str, tooltip: str) -> None:
+            dice_label.setText(text)
+            dice_label.setToolTip(tooltip)
+            dice_label.adjustSize()
+            parent = dice_label.parentWidget()
+            if parent is not None:
+                dice_label.move(max(8, parent.width() - dice_label.width() - 12), 12)
+
+        frame_key = keys[state["idx"]]
+        pseudo_mask_path = pseudo_mask_map.get(frame_key)
+        if pseudo_mask_path is None:
+            show_dice("Dice (pseudo vs GT): N/A", "이 프레임에는 보존된 수도 라벨이 없습니다.")
+            return
+        try:
+            gt_mask = compose_multiclass_mask(
+                {class_id: layer.data for class_id, layer in class_layers.items()}
+            )
+            pseudo_mask = load_multiclass_mask(pseudo_mask_path, gt_mask.shape[:2])
+            dice = binary_dice_score(pseudo_mask, gt_mask)
+        except Exception as exc:
+            show_dice("Dice (pseudo vs GT): error", f"Dice 계산 실패: {type(exc).__name__}: {exc}")
+            return
+        show_dice(
+            f"Dice (pseudo vs GT): {dice:.3f}",
+            "수도 라벨과 현재 GT의 foreground Dice (모든 비배경 클래스 합산)",
+        )
 
     def apply_zoom(z: float):
         z = float(np.clip(z, ZOOM_MIN, ZOOM_MAX))
@@ -716,6 +755,7 @@ def main(argv: list[str] | None = None) -> None:
         scheduleAutosave()
         set_window_title()
         refresh_page_ui()
+        refresh_dice_ui()
 
     # ======================
     # IO / navigation
@@ -737,6 +777,7 @@ def main(argv: list[str] | None = None) -> None:
         dropFrame(frame_key)
         syncMaskSnapshot()
         state["dirty"] = False
+        refresh_dice_ui()
         return mask_path
 
     def saveMask(*_args: object) -> None:
@@ -752,6 +793,7 @@ def main(argv: list[str] | None = None) -> None:
 
         set_window_title(extra=f"(saved classes 1/2: {mask_path.name})")
         refresh_page_ui()
+        refresh_dice_ui()
 
     def flushAutosave(alert: bool = False) -> bool:
         if not state["dirty"]:
@@ -814,6 +856,7 @@ def main(argv: list[str] | None = None) -> None:
         QtCore.QTimer.singleShot(0, cacheFrames)
         set_window_title()
         refresh_page_ui()
+        refresh_dice_ui()
 
     def gotoFrame(frame_index: int) -> None:
         frame_index = int(np.clip(frame_index, 0, len(keys) - 1))
@@ -1208,6 +1251,18 @@ def main(argv: list[str] | None = None) -> None:
     if application is not None:
         application.installEventFilter(input_filter)
         state["input_filter"] = input_filter
+
+    if canvas_widget is not None:
+        dice_label = QtWidgets.QLabel(canvas_widget)
+        dice_label.setStyleSheet(
+            "QLabel { background: rgba(0, 0, 0, 185); color: white; "
+            "border-radius: 4px; padding: 6px 9px; font-weight: bold; }"
+        )
+        dice_label.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        dice_label.setText("Dice (pseudo vs GT): N/A")
+        dice_label.adjustSize()
+        dice_label.move(max(8, canvas_widget.width() - dice_label.width() - 12), 12)
+        dice_label.show()
 
     bindMany(["Q", "Left", "Up"], prevFrame)
     bindMany(["W", "Enter", "Right", "Down"], nextFrame)

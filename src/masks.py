@@ -22,6 +22,26 @@ FILL_STRUCTURE = np.array(
 )
 
 
+def binary_dice_score(reference_mask: np.ndarray, gt_mask: np.ndarray) -> float:
+    """Return foreground Dice for a pseudo-label and its edited GT mask.
+
+    Every non-zero class ID is treated as foreground, which keeps this metric
+    meaningful when a session has more than one editable class. Two empty
+    masks agree perfectly and therefore score 1.0.
+    """
+    reference = np.asarray(reference_mask) > 0
+    gt = np.asarray(gt_mask) > 0
+    if reference.shape != gt.shape:
+        raise ValueError(
+            f"Dice shape mismatch: pseudo {reference.shape} vs GT {gt.shape}"
+        )
+    total = int(reference.sum()) + int(gt.sum())
+    if total == 0:
+        return 1.0
+    intersection = int(np.logical_and(reference, gt).sum())
+    return (2.0 * intersection) / total
+
+
 def load_multiclass_mask(mask_path: Path, shape_hw: tuple[int, int]) -> np.ndarray:
     """Load a configured multi-class mask; treat legacy nonzero masks as class 1."""
     m = iio.imread(mask_path)
