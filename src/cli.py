@@ -21,7 +21,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--pseudo-mask", "--mask-dir",
         dest="pseudo_mask",
-        help="Optional pseudo-mask file or directory used to initialize new masks.",
+        help="Optional read-only pseudo-mask reference. New GT masks start empty.",
     )
     parser.add_argument(
         "--dataset-output", "--output-root",

@@ -25,6 +25,7 @@ from .input_events import InputFilter
 from .input_events import text_input_has_focus
 from .masks import binary_dice_components
 from .masks import compose_multiclass_mask
+from .masks import encode_gt_mask
 from .masks import flood_fill_region
 from .masks import loadFrame
 from .masks import load_multiclass_mask
@@ -48,10 +49,8 @@ import numpy as np
 
 
 LOGGER = logging.getLogger(__name__)
-PSEUDO_LABEL_COLOR = (1.0, 0.35, 0.0, 1.0)  # orange; GT class colours stay configurable
-COMPARISON_COLORS = {
-    "pseudo_only": (255, 100, 0, 255), # orange: pseudo only
-}
+GT_PRIMARY_COLOR = (0.0, 0.75, 1.0, 1.0)  # cyan
+PSEUDO_LABEL_COLOR = (1.0, 0.35, 0.0, 1.0)  # orange
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -63,6 +62,10 @@ def main(argv: list[str] | None = None) -> None:
         dataset_output_root=dataset_output_root,
         video_fps=video_fps,
     )
+    # Existing sessions may have recorded the former green default. Keep the
+    # automatic primary GT class cyan in every session for a stable contrast.
+    if str(CLASS_DEFINITIONS.get(1, {}).get("name", "")).strip() == "class_1":
+        CLASS_DEFINITIONS[1]["color"] = GT_PRIMARY_COLOR
     pseudo_mask_dir = mask_dir.parent / "masks"
     pseudo_mask_map = {
         frame_key: pseudo_mask_dir / f"{frame_key}.png"
@@ -93,7 +96,7 @@ def main(argv: list[str] | None = None) -> None:
         "save_idx": 0,
     }
     for class_id in CLASS_DEFINITIONS:
-        state[f"class_{class_id}_opacity"] = 0.85
+        state[f"class_{class_id}_opacity"] = 1.0
         state[f"class_{class_id}_visible"] = True
 
     frame_cache: FrameCache = {}
@@ -114,7 +117,6 @@ def main(argv: list[str] | None = None) -> None:
 
     img_layer = None
     pseudo_layer = None
-    comparison_layer = None
     class_layers: dict[int, object] = {}
     histories = {class_id: History(MAX_HISTORY) for class_id in CLASS_DEFINITIONS}
 
@@ -257,7 +259,7 @@ def main(argv: list[str] | None = None) -> None:
         page_spin.blockSignals(False)
 
     def refresh_dice_ui() -> None:
-        if dice_label is None:
+        if dice_label is None or state.get("closing"):
             return
 
         def show_dice(text: str, tooltip: str) -> None:
@@ -337,6 +339,20 @@ def main(argv: list[str] | None = None) -> None:
         set_window_title()
 
     def apply_colormaps():
+        # Napari renders later list entries on top: RGB, pseudo, editable GT.
+        if img_layer is not None:
+            index = viewer.layers.index(img_layer)
+            if index != 0:
+                viewer.layers.move(index, 0)
+        if pseudo_layer is not None:
+            pseudo_layer.colormap = DirectLabelColormap(
+                color_dict={None: (0, 0, 0, 0), 0: (0, 0, 0, 0), 1: PSEUDO_LABEL_COLOR}
+            )
+            pseudo_layer.editable = False
+            pseudo_layer.mode = "pan_zoom"
+            index = viewer.layers.index(pseudo_layer)
+            if index != 1:
+                viewer.layers.move(index, 1)
         for class_id, layer in class_layers.items():
             color = CLASS_DEFINITIONS[class_id]["color"]
             cmap = DirectLabelColormap(
@@ -355,39 +371,6 @@ def main(argv: list[str] | None = None) -> None:
                 layers.move(index, len(layers) - 1)
             except Exception:
                 pass
-
-    def comparison_rgba(pseudo_mask: np.ndarray, gt_mask: np.ndarray) -> np.ndarray:
-        """Show only pseudo pixels absent from the topmost GT layer."""
-        pseudo = np.asarray(pseudo_mask) > 0
-        gt = np.asarray(gt_mask) > 0
-        if pseudo.shape != gt.shape:
-            raise ValueError(f"Comparison shape mismatch: {pseudo.shape} vs {gt.shape}")
-        overlay = np.zeros((*gt.shape, 4), dtype=np.uint8)
-        overlay[np.logical_and(pseudo, ~gt)] = COMPARISON_COLORS["pseudo_only"]
-        return overlay
-
-    def refresh_comparison_overlay() -> None:
-        nonlocal comparison_layer
-        if set(class_layers) != set(CLASS_DEFINITIONS):
-            return
-        frame_key = keys[state["idx"]]
-        gt_mask = compose_multiclass_mask(
-            {class_id: layer.data for class_id, layer in class_layers.items()}
-        )
-        pseudo_mask_path = pseudo_mask_map.get(frame_key)
-        if pseudo_mask_path is None:
-            pseudo_mask = np.zeros(gt_mask.shape, dtype=np.uint8)
-        else:
-            pseudo_mask = load_multiclass_mask(pseudo_mask_path, gt_mask.shape[:2])
-        overlay = comparison_rgba(pseudo_mask, gt_mask)
-        if comparison_layer is None:
-            comparison_layer = viewer.add_image(
-                overlay,
-                name="Pseudo-only difference (orange; below GT)",
-                rgb=True,
-            )
-        else:
-            comparison_layer.data = overlay
 
     def _class_opacity_changed(class_id: int, _event=None):
         layer = class_layers.get(class_id)
@@ -417,7 +400,11 @@ def main(argv: list[str] | None = None) -> None:
                 f"{cid}={definition['name']}"
                 for cid, definition in CLASS_DEFINITIONS.items()
             )
-            class_summary_label.setText(f"Saved mask values: background=0, {summary}.")
+            class_summary_label.setText(
+                "Saved GT PNG: background=0, foreground=255."
+                if set(CLASS_DEFINITIONS) == {1}
+                else f"Saved mask values: background=0, {summary}."
+            )
 
     def _class_name_changed(class_id: int, _event=None) -> None:
         """Keep user-entered Napari layer names in the class UI for this session."""
@@ -428,6 +415,8 @@ def main(argv: list[str] | None = None) -> None:
         default_suffix = f" (class {class_id})"
         if name.endswith(default_suffix):
             name = name[: -len(default_suffix)].strip()
+        if name.startswith("GT | "):
+            name = name[len("GT | "):].strip()
         if not name:
             return
         CLASS_DEFINITIONS[class_id]["name"] = name
@@ -639,6 +628,8 @@ def main(argv: list[str] | None = None) -> None:
             None,
         )
         if selected_class_id is None or selected_class_id == state["active"]:
+            if selected_class_id is None and not state["suspend"]:
+                apply_active_state_to_layer()
             return
         remember_current_brush_size()
         state["active"] = selected_class_id
@@ -693,7 +684,7 @@ def main(argv: list[str] | None = None) -> None:
             "name": name,
             "color": default_class_color(class_id),
         }
-        state[f"class_{class_id}_opacity"] = 0.85
+        state[f"class_{class_id}_opacity"] = 1.0
         state[f"class_{class_id}_visible"] = True
         histories[class_id] = History(MAX_HISTORY)
 
@@ -701,7 +692,7 @@ def main(argv: list[str] | None = None) -> None:
         try:
             layer = viewer.add_labels(
                 np.zeros(img_layer.data.shape[:2], dtype=np.uint8),
-                name=f"{name} (class {class_id})",
+                name=f"GT | {name} (class {class_id})",
             )
             class_layers[class_id] = layer
             connect_class_layer_events(class_id, layer)
@@ -849,7 +840,6 @@ def main(argv: list[str] | None = None) -> None:
 
     def refresh_metrics() -> None:
         refresh_dice_ui()
-        refresh_comparison_overlay()
 
     # ======================
     # IO / navigation
@@ -863,7 +853,7 @@ def main(argv: list[str] | None = None) -> None:
             {class_id: layer.data for class_id, layer in class_layers.items()}
         )
         try:
-            iio.imwrite(mask_path, mask_data)
+            iio.imwrite(mask_path, encode_gt_mask(mask_data))
             write_mask_preview(mask_path, mask_data)
         except Exception as exc:
             raise RuntimeError(f"Mask save failed: {mask_path}") from exc
@@ -940,13 +930,13 @@ def main(argv: list[str] | None = None) -> None:
             if pseudo_layer is None:
                 pseudo_layer = viewer.add_labels(
                     pseudo_data,
-                    name="Pseudo label (reference, orange)",
+                    name="Pseudo mask | orange (read-only)",
                 )
                 pseudo_layer.colormap = DirectLabelColormap(
                     color_dict={None: (0, 0, 0, 0), 0: (0, 0, 0, 0), 1: PSEUDO_LABEL_COLOR}
                 )
                 pseudo_layer.opacity = 0.55
-                pseudo_layer.visible = False
+                pseudo_layer.visible = True
                 try:
                     pseudo_layer.editable = False
                 except Exception:
@@ -959,7 +949,7 @@ def main(argv: list[str] | None = None) -> None:
                 if layer is None:
                     layer = viewer.add_labels(
                         class_masks[class_id],
-                        name=f"{definition['name']} (class {class_id})",
+                        name=f"GT | {definition['name']} (class {class_id})",
                     )
                     class_layers[class_id] = layer
                     connect_class_layer_events(class_id, layer)
@@ -968,7 +958,6 @@ def main(argv: list[str] | None = None) -> None:
         finally:
             state["suspend"] = False
 
-        refresh_comparison_overlay()
         state["dirty"] = False
         syncMaskSnapshot()
         apply_colormaps()
@@ -1016,6 +1005,43 @@ def main(argv: list[str] | None = None) -> None:
     # ======================
     # ops
     # ======================
+    def clear_current_gt(*_args) -> None:
+        """Start this frame empty while preserving the current GT as a backup."""
+        if not class_layers:
+            return
+        current = compose_multiclass_mask(
+            {class_id: layer.data for class_id, layer in class_layers.items()}
+        )
+        if not np.any(current):
+            return
+        frame_key = keys[state["idx"]]
+        backup_dir = mask_dir.parent / "GT_mask_backups" / frame_key
+        try:
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            index = 1
+            backup_path = backup_dir / f"before_clear_{index:04d}.png"
+            while backup_path.exists():
+                index += 1
+                backup_path = backup_dir / f"before_clear_{index:04d}.png"
+            iio.imwrite(backup_path, encode_gt_mask(current))
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(
+                viewer.window._qt_window,
+                "GT backup failed",
+                f"GT를 백업하지 못해 비우기를 취소합니다.\n\n{exc}",
+            )
+            return
+        state["suspend"] = True
+        try:
+            for class_id, layer in class_layers.items():
+                layer.data = np.zeros_like(layer.data, dtype=np.uint8)
+                histories[class_id].clear()
+        finally:
+            state["suspend"] = False
+        markChange("GT cleared")
+        apply_active_state_to_layer()
+        log_append(f"GT cleared; backup: {backup_path.relative_to(mask_dir.parent)}")
+
     def copy_previous_to_active_class(*_args):
         class_id = int(state["active"])
         layer = class_layers.get(class_id)
@@ -1175,6 +1201,13 @@ def main(argv: list[str] | None = None) -> None:
     save_btn.clicked.connect(saveMask)
     L.addWidget(save_btn)
 
+    clear_gt_btn = QtWidgets.QPushButton("Start empty GT (backup current frame)")
+    clear_gt_btn.setToolTip(
+        "현재 프레임의 기존 GT를 GT_mask_backups/에 백업하고 빈 GT부터 그립니다."
+    )
+    clear_gt_btn.clicked.connect(clear_current_gt)
+    L.addWidget(clear_gt_btn)
+
     delete_btn = QtWidgets.QPushButton("DELETE current frame + mask")
     delete_btn.clicked.connect(delete_current_pair)
     L.addWidget(delete_btn)
@@ -1219,7 +1252,9 @@ def main(argv: list[str] | None = None) -> None:
         f"{class_id}={definition['name']}" for class_id, definition in CLASS_DEFINITIONS.items()
     )
     class_summary_label = QtWidgets.QLabel(
-        f"Saved mask values: background=0, {class_summary}."
+        "Saved GT PNG: background=0, foreground=255."
+        if set(CLASS_DEFINITIONS) == {1}
+        else f"Saved mask values: background=0, {class_summary}."
     )
     L.addWidget(class_summary_label)
 
@@ -1427,10 +1462,14 @@ def main(argv: list[str] | None = None) -> None:
     try:
         napari.run()
     finally:
-        if autosave_timer.isActive():
-            autosave_timer.stop()
-        if metrics_timer.isActive():
-            metrics_timer.stop()
+        state["closing"] = True
+        for timer in (autosave_timer, metrics_timer, change_timer):
+            try:
+                timer.stop()
+            except RuntimeError:
+                # The native window can destroy its child timers before
+                # napari.run() returns. Still flush the final GT to disk.
+                pass
         try:
             if checkMaskChange():
                 state["dirty"] = True

@@ -11,6 +11,7 @@ from .config import VIDEO_EXTS
 from .images import list_images
 from .images import load_rgb
 from .masks import load_multiclass_mask
+from .masks import encode_gt_mask
 from .masks import write_mask_preview
 from .video import choose_video_target_fps
 from .video import default_video_project_root
@@ -170,7 +171,11 @@ def prepare_input_output(
 def write_dataset_metadata(dataset_root: Path) -> Path:
     """Write class metadata beside the images and GT-mask folders."""
     metadata = {
-        "format": "semantic-segmentation-indexed-png",
+        "format": (
+            "semantic-segmentation-binary-mask"
+            if set(CLASS_DEFINITIONS) == {1}
+            else "semantic-segmentation-indexed-png"
+        ),
         "images": "images",
         "masks": "GT_mask",
         "gt_masks": "GT_mask (manual ground-truth masks)",
@@ -181,6 +186,7 @@ def write_dataset_metadata(dataset_root: Path) -> Path:
         "classes": [
             {
                 "id": class_id,
+                "mask_value": 255 if set(CLASS_DEFINITIONS) == {1} else class_id,
                 "name": str(definition["name"]),
                 "color_rgba": list(definition["color"]),
             }
@@ -283,28 +289,26 @@ def prepare_segmentation_dataset(
         image = load_rgb(image_path)
         pseudo_path = pseudo_masks.get(stem)
 
-        # Keep a separate, immutable copy of the pseudo-label. `GT_mask/` is
-        # subsequently edited into GT, so it cannot serve as a Dice baseline.
+        # The reference and manually painted GT are independent arrays.
         if pseudo_path is not None:
             pseudo_reference_path = pseudo_masks_dir / f"{stem}.png"
             if not pseudo_reference_path.exists():
                 pseudo_masks_dir.mkdir(parents=True, exist_ok=True)
                 # Preserve the supplied PNG exactly as the original pseudo
-                # label. The editable GT below is separately normalized to
-                # indexed class IDs as needed by the labeler.
+                # label. New GT masks below start empty.
                 if pseudo_path.suffix.lower() == ".png":
                     shutil.copy2(pseudo_path, pseudo_reference_path)
                 else:
                     iio.imwrite(pseudo_reference_path, iio.imread(pseudo_path))
 
         if not mask_path.exists():
-            if pseudo_path is None:
-                initial_mask = np.zeros(image.shape[:2], dtype=np.uint8)
-            else:
-                initial_mask = load_multiclass_mask(pseudo_path, image.shape[:2])
-            iio.imwrite(mask_path, initial_mask.astype(np.uint8))
+            iio.imwrite(mask_path, np.zeros(image.shape[:2], dtype=np.uint8))
         indexed_mask = load_multiclass_mask(mask_path, image.shape[:2])
         register_mask_class_ids(indexed_mask)
+        # Upgrade older 0/1 binary GT without changing foreground pixels.
+        encoded = encode_gt_mask(indexed_mask)
+        if not np.array_equal(np.asarray(iio.imread(mask_path)), encoded):
+            iio.imwrite(mask_path, encoded)
         write_mask_preview(mask_path, indexed_mask)
         mask_map[stem] = mask_path
 

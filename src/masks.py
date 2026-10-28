@@ -62,6 +62,14 @@ def load_multiclass_mask(mask_path: Path, shape_hw: tuple[int, int]) -> np.ndarr
     return mask
 
 
+def encode_gt_mask(mask: np.ndarray) -> np.ndarray:
+    """Save single-class GT as visible 0/255 PNG; retain multi-class IDs."""
+    indexed = np.asarray(mask, dtype=np.uint8)
+    if set(CLASS_DEFINITIONS) == {1}:
+        return (indexed > 0).astype(np.uint8) * 255
+    return indexed
+
+
 def compose_multiclass_mask(class_masks: Mapping[int, np.ndarray]) -> np.ndarray:
     """Combine class layers into one mask; later class IDs win on overlap."""
     if set(class_masks) != set(CLASS_DEFINITIONS):
